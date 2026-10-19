@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  kerma-node:
+    build: .
+    container_name: kerma_node
+    ports:
+      - "18018:18018"
+    environment:
+      - NODE_PORT=18018
+      - MY_ADDRESS=kermanode.net:18018
+    restart: always
