@@ -1,0 +1,6 @@
+peers.json
+peers.json.tmp
+__pycache__
+*.pyc
+*.tar
+.git

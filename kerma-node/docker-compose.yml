@@ -8,5 +8,13 @@ services:
       - "18018:18018"
     environment:
       - NODE_PORT=18018
+      # Public host:port advertised to other peers
       - MY_ADDRESS=kermanode.net:18018
+      # Location of the persistent peer list
+      - PEERS_FILE=/data/peers.json
+    volumes:
+      - peers_data:/data
     restart: always
+
+volumes:
+  peers_data:
