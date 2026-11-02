@@ -1,4 +1,4 @@
-"""End-to-end tests for the Kerma node (Task 1).
+"""End-to-end tests for the Kerma node (Task 1 and Task 2).
 
 Start the node first, e.g.:
 
@@ -9,6 +9,8 @@ Then run the tests from the project root:
     python auto_test.py            # all fast tests
     python auto_test.py --slow     # additionally runs the 20 s handshake timeout test
 
+The Task 2 tests sign transactions and need the 'cryptography' package on the host
+(pip install cryptography).
 The target can be changed with the environment variables KERMA_HOST and KERMA_PORT
 (default 127.0.0.1:18018). The script exits with status 1 if any test fails.
 """
@@ -415,6 +417,330 @@ def test_handshake_timeout():
     c.expect_closed()
 
 
+# ---------------------------------------------------------------------------
+# Task 2: object exchange, gossiping and transaction validation
+# ---------------------------------------------------------------------------
+
+GENESIS_ID = '00002fa163c7dab0991544424b9fd302bb1782b185e5a3bbdf12afb758e57dee'
+EXAMPLE_COINBASE = {
+    'height': 0,
+    'outputs': [{
+        'pubkey': '85acb336a150b16a9c6c8c27a4e9c479d9f99060a7945df0bb1b53365e98969b',
+        'value': 50000000000000,
+    }],
+    'type': 'transaction',
+}
+EXAMPLE_COINBASE_ID = 'd46d09138f0251edc32e28f1a744cb0b7286850e4c9c777d7e3c6e459b289347'
+EXAMPLE_TX = {
+    'inputs': [{
+        'outpoint': {'index': 0, 'txid': EXAMPLE_COINBASE_ID},
+        'sig': '6204bbab1b736ce2133c4ea43aff3767c49c881ac80b57ba38a3bab980466644'
+               'cdbacc86b1f4357cfe45e6374b963f5455f26df0a86338310df33e50c15d7f04',
+    }],
+    'outputs': [
+        {'pubkey': 'b539258e808b3e3354b9776d1ff4146b52282e864f56224e7e33e7932ec72985', 'value': 10},
+        {'pubkey': '8dbcd2401c89c04d6e53c81c90aa0b551cc8fc47c0469217c8f5cfbae1e911f9',
+         'value': 49999999999990},
+    ],
+    'type': 'transaction',
+}
+EXAMPLE_TX_ID = '895ca2bea390b7508f780c7174900a631e73905dcdc6c07a6b61ede2ebd4033f'
+
+
+def object_id(obj):
+    """blake2s hash of the canonical JSON of obj."""
+    import hashlib
+    return hashlib.blake2s(canonical(obj)).hexdigest()
+
+
+class Wallet:
+    """An Ed25519 key pair (requires the 'cryptography' package)."""
+
+    def __init__(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        self.key = Ed25519PrivateKey.generate()
+        self.pubkey = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+
+
+def new_coinbase(wallet, value=100):
+    """A coinbase transaction that is new to the node (random height)."""
+    return {
+        'type': 'transaction',
+        'height': random.randint(0, 10 ** 9),
+        'outputs': [{'pubkey': wallet.pubkey, 'value': value}],
+    }
+
+
+def signed_tx(inputs, outputs):
+    """inputs: list of (txid, index, wallet); outputs: list of (pubkey, value)."""
+    tx = {
+        'type': 'transaction',
+        'inputs': [{'outpoint': {'txid': t, 'index': i}, 'sig': None} for t, i, _ in inputs],
+        'outputs': [{'pubkey': p, 'value': v} for p, v in outputs],
+    }
+    payload = canonical(tx)
+    for inp, (_, _, wallet) in zip(tx['inputs'], inputs):
+        inp['sig'] = wallet.key.sign(payload).hex()
+    return tx
+
+
+def read_type(c, msg_type, timeout=3.0):
+    """Read messages until one of the given type arrives."""
+    deadline = time.time() + timeout
+    while True:
+        msg = c.read_msg(max(0.01, deadline - time.time()))
+        if msg.get('type') == msg_type:
+            return msg
+
+
+def expect_ihave(c, oid, timeout=3.0):
+    """Assert that an ihaveobject for oid arrives."""
+    deadline = time.time() + timeout
+    while True:
+        msg = read_type(c, 'ihaveobject', max(0.01, deadline - time.time()))
+        if msg.get('objectid') == oid:
+            return
+
+
+def expect_no_ihave(c, oid, timeout=1.0):
+    """Assert that no ihaveobject for oid arrives within timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            msg = c.read_msg(max(0.01, deadline - time.time()))
+        except TimeoutError:
+            return
+        check(
+            not (msg.get('type') == 'ihaveobject' and msg.get('objectid') == oid),
+            f'invalid object {oid} was gossiped',
+        )
+
+
+def send_object(c, obj):
+    c.send_json({'type': 'object', 'object': obj})
+
+
+def get_object(c, oid):
+    """Request oid and return the object."""
+    c.send_json({'type': 'getobject', 'objectid': oid})
+    msg = read_type(c, 'object')
+    check(set(msg) == {'type', 'object'}, f'unexpected keys in object message: {msg}')
+    return msg['object']
+
+
+def stored_coinbase(c):
+    """Send a new coinbase via c, wait until it is stored and return (wallet, cb, id)."""
+    w = Wallet()
+    cb = new_coinbase(w)
+    send_object(c, cb)
+    oid = object_id(cb)
+    check(get_object(c, oid) == cb, 'coinbase was not stored')
+    return w, cb, oid
+
+
+def test_genesis_block_available():
+    """The genesis block is in the object database from the start."""
+    c = handshake()
+    obj = get_object(c, GENESIS_ID)
+    check(object_id(obj) == GENESIS_ID, f'wrong genesis block: {obj}')
+
+
+def test_example_transactions_accepted():
+    """The example transactions from the task description are accepted and stored."""
+    c = handshake()
+    send_object(c, EXAMPLE_COINBASE)
+    check(get_object(c, EXAMPLE_COINBASE_ID) == EXAMPLE_COINBASE, 'example coinbase not stored')
+    send_object(c, EXAMPLE_TX)
+    check(get_object(c, EXAMPLE_TX_ID) == EXAMPLE_TX, 'example transaction not stored')
+
+
+def test_object_send_and_request_same_grader():
+    """Grader 1 sends a new valid transaction and can request it back."""
+    c = handshake()
+    stored_coinbase(c)
+
+
+def test_object_send_and_request_other_grader():
+    """Grader 1 sends a new valid transaction, Grader 2 can request it."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    cb = new_coinbase(Wallet())
+    send_object(g1, cb)
+    expect_ihave(g2, object_id(cb))
+    check(get_object(g2, object_id(cb)) == cb, 'Grader 2 did not receive the object')
+
+
+def test_valid_transaction_gossiped():
+    """A new valid (signed) transaction from Grader 1 is announced to Grader 2."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    w, cb, cb_id = stored_coinbase(g1)
+    expect_ihave(g2, cb_id)
+    tx = signed_tx([(cb_id, 0, w)], [(Wallet().pubkey, 60), (w.pubkey, 40)])
+    send_object(g1, tx)
+    expect_ihave(g2, object_id(tx))
+
+
+def test_ihaveobject_triggers_getobject():
+    """ihaveobject with an unknown id is answered with getobject for that id."""
+    c = handshake()
+    oid = object_id({'random': random.random()})
+    c.send_json({'type': 'ihaveobject', 'objectid': oid})
+    msg = read_type(c, 'getobject')
+    check(msg == {'type': 'getobject', 'objectid': oid}, f'unexpected getobject: {msg}')
+
+
+def test_ihaveobject_known_object_not_requested():
+    """ihaveobject with a known id is not answered with getobject."""
+    c = handshake()
+    c.send_json({'type': 'ihaveobject', 'objectid': GENESIS_ID})
+    c.send(GETPEERS)
+    msg = c.read_msg()  # the next message must be the peers reply, not a getobject
+    check(msg.get('type') == 'peers', f'expected only a peers reply, got {msg}')
+
+
+def test_getobject_unknown():
+    """getobject for an unknown id gives UNKNOWN_OBJECT and keeps the connection open."""
+    c = handshake()
+    c.send_json({'type': 'getobject', 'objectid': 'ee' * 32})
+    msg = read_type(c, 'error')
+    check(msg.get('name') == 'UNKNOWN_OBJECT', f'expected UNKNOWN_OBJECT, got {msg}')
+    request_peers(c)
+
+
+def test_invalid_object_messages():
+    """Malformed getobject/ihaveobject/object messages give INVALID_FORMAT."""
+    payloads = [
+        {'type': 'getobject'},
+        {'type': 'getobject', 'objectid': 'XYZ'},
+        {'type': 'getobject', 'objectid': 'AB' * 32},
+        {'type': 'ihaveobject', 'objectid': 12},
+        {'type': 'ihaveobject', 'objectid': GENESIS_ID, 'extra': 1},
+        {'type': 'object'},
+        {'type': 'object', 'object': 'nope'},
+        {'type': 'object', 'object': {'type': 'banana'}},
+    ]
+    for p in payloads:
+        c = handshake()
+        c.send_json(p)
+        try:
+            expect_error(c, 'INVALID_FORMAT')
+        except AssertionError as e:
+            raise AssertionError(f'payload {p}: {e}')
+
+
+def _invalid_tx_cases():
+    """Return ([(description, tx, expected_error)], coinbase that must be stored first)."""
+    w, other = Wallet(), Wallet()
+    cb = new_coinbase(w, value=100)
+    cb_id = object_id(cb)
+    tampered = signed_tx([(cb_id, 0, w)], [(other.pubkey, 10)])
+    tampered['outputs'][0]['value'] = 11
+    return [
+        ('wrong signer', signed_tx([(cb_id, 0, other)], [(other.pubkey, 10)]), 'INVALID_TX_SIGNATURE'),
+        ('tampered output', tampered, 'INVALID_TX_SIGNATURE'),
+        ('outputs exceed inputs', signed_tx([(cb_id, 0, w)], [(other.pubkey, 101)]),
+         'INVALID_TX_CONSERVATION'),
+        ('same outpoint twice', signed_tx([(cb_id, 0, w)] * 2, [(other.pubkey, 1)]),
+         'INVALID_TX_CONSERVATION'),
+        ('index too high', signed_tx([(cb_id, 1, w)], [(other.pubkey, 1)]), 'INVALID_TX_OUTPOINT'),
+        ('outpoint is a block', signed_tx([(GENESIS_ID, 0, w)], [(other.pubkey, 1)]),
+         'INVALID_FORMAT'),
+        ('negative value', {'type': 'transaction', 'height': 1,
+                            'outputs': [{'pubkey': w.pubkey, 'value': -1}]}, 'INVALID_FORMAT'),
+        ('float value', {'type': 'transaction', 'height': 1,
+                         'outputs': [{'pubkey': w.pubkey, 'value': 1.5}]}, 'INVALID_FORMAT'),
+        ('invalid pubkey', {'type': 'transaction', 'height': 1,
+                            'outputs': [{'pubkey': 'xyz', 'value': 1}]}, 'INVALID_FORMAT'),
+        ('no inputs', {'type': 'transaction', 'inputs': [], 'outputs': []}, 'INVALID_FORMAT'),
+        ('missing inputs', {'type': 'transaction', 'outputs': []}, 'INVALID_FORMAT'),
+        ('height and inputs', dict(signed_tx([(cb_id, 0, w)], []), height=1), 'INVALID_FORMAT'),
+        ('additional key', dict(cb, extra=1), 'INVALID_FORMAT'),
+        ('invalid sig format', {'type': 'transaction', 'outputs': [], 'inputs': [
+            {'outpoint': {'txid': cb_id, 'index': 0}, 'sig': 'abc'}]}, 'INVALID_FORMAT'),
+    ], cb
+
+
+def test_invalid_transactions_rejected_and_not_gossiped():
+    """Invalid transactions give the right error, close the connection and are not gossiped."""
+    cases, cb = _invalid_tx_cases()
+    setup = handshake()
+    send_object(setup, cb)
+    get_object(setup, object_id(cb))
+    for desc, tx, error in cases:
+        g1, g2 = handshake(), handshake()
+        request_peers(g2)
+        send_object(g1, tx)
+        try:
+            expect_error(g1, error)
+            expect_no_ihave(g2, object_id(tx))
+            g2.send_json({'type': 'getobject', 'objectid': object_id(tx)})
+            msg = read_type(g2, 'error')
+            check(msg.get('name') == 'UNKNOWN_OBJECT', f'invalid tx was stored: {msg}')
+        except AssertionError as e:
+            raise AssertionError(f'{desc}: {e}')
+        g1.close()
+        g2.close()
+
+
+def test_unknown_outpoint_keeps_connection():
+    """A transaction spending an unknown object gives UNKNOWN_OBJECT without closing."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    w = Wallet()
+    tx = signed_tx([('ee' * 32, 0, w)], [(w.pubkey, 1)])
+    send_object(g1, tx)
+    msg = read_type(g1, 'error')
+    check(msg.get('name') == 'UNKNOWN_OBJECT', f'expected UNKNOWN_OBJECT, got {msg}')
+    request_peers(g1)
+    expect_no_ihave(g2, object_id(tx))
+
+
+def test_known_object_not_gossiped_again():
+    """Sending an already known object again does not trigger gossip."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    _, cb, cb_id = stored_coinbase(g1)
+    expect_ihave(g2, cb_id)
+    send_object(g1, cb)
+    expect_no_ihave(g2, cb_id)
+    request_peers(g1)
+
+
+def test_non_transaction_object_gives_invalid_format():
+    """Receiving an object with type != 'transaction' gives INVALID_FORMAT."""
+    c = handshake()
+    send_object(c, {
+        'T': '0000abc000000000000000000000000000000000000000000000000000000000',
+        'created': 1671062401,
+        'miner': 'Marabu',
+        'nonce': '00000000000000000000000000000000000000000000000000000000005bb0f2',
+        'note': 'non-genesis block',
+        'previd': GENESIS_ID,
+        'txids': [],
+        'type': 'block',
+    })
+    expect_error(c, 'INVALID_FORMAT')
+
+
+TASK2_TESTS = [
+    test_genesis_block_available,
+    test_example_transactions_accepted,
+    test_object_send_and_request_same_grader,
+    test_object_send_and_request_other_grader,
+    test_valid_transaction_gossiped,
+    test_ihaveobject_triggers_getobject,
+    test_ihaveobject_known_object_not_requested,
+    test_getobject_unknown,
+    test_invalid_object_messages,
+    test_invalid_transactions_rejected_and_not_gossiped,
+    test_unknown_outpoint_keeps_connection,
+    test_known_object_not_gossiped_again,
+    test_non_transaction_object_gives_invalid_format,
+]
+
+
 FAST_TESTS = [
     test_handshake_and_getpeers,
     test_hello_without_agent_is_accepted,
@@ -446,7 +772,7 @@ def main():
         print(f'Cannot connect to {HOST}:{PORT} ({e}). Is the node running?')
         sys.exit(2)
 
-    tests = list(FAST_TESTS)
+    tests = list(FAST_TESTS) + TASK2_TESTS
     if '--slow' in sys.argv:
         tests.append(test_handshake_timeout)
 

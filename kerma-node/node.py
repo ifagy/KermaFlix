@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Set
 
 from connection import ConnectionHandler, STREAM_LIMIT
+from object_db import ObjectDB
 from peer_manager import PeerManager
 
 logger = logging.getLogger('KermaNode')
@@ -25,16 +26,22 @@ class KermaNode:
             host: str = '0.0.0.0',
             port: int = 18018,
             my_address: Optional[str] = None,
+            peer_manager: Optional[PeerManager] = None,
+            object_db: Optional[ObjectDB] = None,
     ):
         """Create the node.
 
         my_address is the 'host:port' this node advertises to other peers.
+        peer_manager and object_db default to instances using the configured files.
         """
         self.host = host
         self.port = port
-        self.peer_manager = PeerManager(my_address=my_address)
+        self.peer_manager = peer_manager or PeerManager(my_address=my_address)
+        self.object_db = object_db or ObjectDB()
         self.server = None
         self.active_outbound = set()
+        # Connections with a completed handshake (receivers of gossip).
+        self.connections: Set[ConnectionHandler] = set()
         self._tasks = set()
 
     def _spawn(self, coro) -> None:
@@ -43,15 +50,43 @@ class KermaNode:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    # ---------- Connection registry and gossip ----------
+
+    def register(self, handler: ConnectionHandler) -> None:
+        """Remember a connection after its handshake has completed."""
+        self.connections.add(handler)
+
+    def unregister(self, handler: ConnectionHandler) -> None:
+        """Forget a closed connection."""
+        self.connections.discard(handler)
+
+    async def broadcast(
+            self, msg: dict, exclude: Optional[ConnectionHandler] = None
+    ) -> None:
+        """Send msg to all connected peers except exclude (concurrently)."""
+        targets = [
+            h for h in list(self.connections) if h is not exclude and not h.is_closed
+        ]
+        await asyncio.gather(*(h.send_msg(msg) for h in targets))
+
+    def _new_handler(self, reader, writer, **kwargs) -> ConnectionHandler:
+        """Create a ConnectionHandler wired to this node."""
+        return ConnectionHandler(
+            reader,
+            writer,
+            self.peer_manager,
+            object_db=self.object_db,
+            network=self,
+            **kwargs,
+        )
+
     async def handle_incoming(
             self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
         """Handle a newly accepted incoming connection."""
         peer_addr = writer.get_extra_info('peername')
         logger.info(f'Incoming connection from {peer_addr}')
-        handler = ConnectionHandler(
-            reader, writer, self.peer_manager, is_outbound=False
-        )
+        handler = self._new_handler(reader, writer, is_outbound=False)
         try:
             await handler.handle()
         finally:
@@ -85,10 +120,9 @@ class KermaNode:
                 self.peer_manager.record_failure(peer_str)
                 return
 
-            handler = ConnectionHandler(
+            handler = self._new_handler(
                 reader,
                 writer,
-                self.peer_manager,
                 is_outbound=True,
                 remote_peer_str=peer_str,
             )

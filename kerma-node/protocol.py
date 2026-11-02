@@ -26,6 +26,9 @@ ALLOWED_KEYS = {
     'getpeers': {'type'},
     'peers': {'type', 'peers'},
     'error': {'type', 'name', 'msg'},
+    'getobject': {'type', 'objectid'},
+    'ihaveobject': {'type', 'objectid'},
+    'object': {'type', 'object'},
 }
 
 MAX_PEERS_PER_MESSAGE = 30
@@ -35,6 +38,7 @@ VERSION_RE = re.compile(r'0\.10\.[0-9]')
 DNS_RE = re.compile(r'[a-zA-Z0-9.\-_]{3,50}')
 PORT_RE = re.compile(r'[0-9]{1,5}')
 IPV4_RE = re.compile(r'[0-9]{1,3}(\.[0-9]{1,3}){3}')
+OBJECTID_RE = re.compile(r'[0-9a-f]{64}')
 
 
 def serialize_canonical_json(data: Dict[str, Any]) -> bytes:
@@ -99,6 +103,16 @@ def validate_message(msg: Any) -> Tuple[bool, str, str]:
             return False, 'INVALID_FORMAT', 'Missing or invalid error name'
         if 'msg' in msg and not isinstance(msg['msg'], str):
             return False, 'INVALID_FORMAT', 'Invalid error msg'
+
+    elif msg_type in ('getobject', 'ihaveobject'):
+        objectid = msg.get('objectid')
+        if not isinstance(objectid, str) or not OBJECTID_RE.fullmatch(objectid):
+            return False, 'INVALID_FORMAT', 'Missing or invalid objectid'
+
+    elif msg_type == 'object':
+        # The object itself is validated by the object handling logic.
+        if not isinstance(msg.get('object'), dict):
+            return False, 'INVALID_FORMAT', 'Missing or invalid object'
 
     return True, '', ''
 

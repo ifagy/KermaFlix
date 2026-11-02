@@ -5,6 +5,7 @@ import json
 import logging
 from typing import Any, Optional, Tuple
 
+from objects import KermaError, object_id, validate_transaction
 from protocol import serialize_canonical_json, validate_message
 
 logger = logging.getLogger('Connection')
@@ -13,6 +14,11 @@ logger = logging.getLogger('Connection')
 HANDSHAKE_TIMEOUT = 20.0
 # Maximum length of a single message line in bytes.
 STREAM_LIMIT = 1024 * 1024
+
+
+def _reject_constant(name: str):
+    """json.loads hook: NaN and Infinity are not valid JSON."""
+    raise ValueError(f'Invalid JSON constant {name}')
 
 
 class ConnectionHandler:
@@ -25,16 +31,23 @@ class ConnectionHandler:
             peer_manager,
             is_outbound: bool = False,
             remote_peer_str: Optional[str] = None,
+            object_db=None,
+            network=None,
     ):
         """Store the stream objects and connection metadata.
 
         remote_peer_str is the 'host:port' we connected to (outbound only).
+        object_db is the ObjectDB used for object exchange.
+        network provides register(handler), unregister(handler) and
+        broadcast(msg, exclude) for gossiping (usually the KermaNode).
         """
         self.reader = reader
         self.writer = writer
         self.peer_manager = peer_manager
         self.is_outbound = is_outbound
         self.remote_peer_str = remote_peer_str
+        self.object_db = object_db
+        self.network = network
         self.handshake_done = False
         self.is_closed = False
         self.label = remote_peer_str or str(writer.get_extra_info('peername'))
@@ -69,6 +82,8 @@ class ConnectionHandler:
         """Close the underlying stream (safe to call multiple times)."""
         if not self.is_closed:
             self.is_closed = True
+            if self.network is not None:
+                self.network.unregister(self)
             try:
                 self.writer.close()
             except Exception:
@@ -83,7 +98,7 @@ class ConnectionHandler:
         Returns (message, None) on success or (None, error_text) on failure.
         """
         try:
-            return json.loads(line.decode('utf-8')), None
+            return json.loads(line.decode('utf-8'), parse_constant=_reject_constant), None
         except Exception as e:
             return None, f'Invalid JSON: {e}'
 
@@ -155,6 +170,8 @@ class ConnectionHandler:
         self.handshake_done = True
         if self.is_outbound and self.remote_peer_str:
             self.peer_manager.record_success(self.remote_peer_str)
+        if self.network is not None:
+            self.network.register(self)
 
         # Process all further messages.
         while not self.is_closed:
@@ -202,6 +219,62 @@ class ConnectionHandler:
                     f'[{self.label}] Received error: {msg.get("name")} - {msg.get("msg")}'
                 )
 
+            elif msg_type in ('getobject', 'ihaveobject', 'object'):
+                try:
+                    await self._handle_object_message(msg)
+                except KermaError as e:
+                    if e.fatal:
+                        await self.send_error_and_close(e.name, e.msg)
+                        return
+                    logger.info(f'[{self.label}] Sending {e.name} ({e.msg})')
+                    await self.send_msg({'type': 'error', 'name': e.name, 'msg': e.msg})
+
             else:
                 # Valid message types without handling are ignored.
                 logger.debug(f'[{self.label}] Ignoring message type: {msg_type}')
+
+    # ---------- Object exchange ----------
+
+    async def _handle_object_message(self, msg: dict) -> None:
+        """Handle getobject, ihaveobject and object messages.
+
+        Raises KermaError if an error has to be reported to the peer.
+        """
+        if self.object_db is None:
+            return
+        msg_type = msg['type']
+
+        if msg_type == 'getobject':
+            obj = self.object_db.get(msg['objectid'])
+            if obj is None:
+                raise KermaError(
+                    'UNKNOWN_OBJECT', f'Object {msg["objectid"]} is not known'
+                )
+            await self.send_msg({'type': 'object', 'object': obj})
+
+        elif msg_type == 'ihaveobject':
+            if not self.object_db.has(msg['objectid']):
+                await self.send_msg({'type': 'getobject', 'objectid': msg['objectid']})
+
+        elif msg_type == 'object':
+            await self._receive_object(msg['object'])
+
+    async def _receive_object(self, obj: dict) -> None:
+        """Validate, store and gossip a received object; known objects are ignored."""
+        oid = object_id(obj)
+        if self.object_db.has(oid):
+            logger.debug(f'[{self.label}] Ignoring known object {oid}')
+            return
+
+        obj_type = obj.get('type')
+        if obj_type != 'transaction':
+            raise KermaError('INVALID_FORMAT', f'Unsupported object type {obj_type!r}')
+
+        validate_transaction(obj, self.object_db)
+
+        self.object_db.put(obj)
+        logger.info(f'[{self.label}] Stored new valid {obj_type} {oid}')
+        if self.network is not None:
+            await self.network.broadcast(
+                {'type': 'ihaveobject', 'objectid': oid}
+            )

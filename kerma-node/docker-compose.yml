@@ -12,6 +12,8 @@ services:
       - MY_ADDRESS=kermanode.net:18018
       # Location of the persistent peer list
       - PEERS_FILE=/data/peers.json
+      # Location of the persistent object database
+      - OBJECTS_DB=/data/objects.db
     volumes:
       - peers_data:/data
     restart: always

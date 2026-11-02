@@ -1,5 +1,7 @@
 peers.json
 peers.json.tmp
+objects.db
+objects.db-journal
 __pycache__
 *.pyc
 *.tar
