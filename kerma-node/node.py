@@ -7,6 +7,7 @@ from typing import Optional, Set
 from connection import ConnectionHandler, STREAM_LIMIT
 from object_db import ObjectDB
 from peer_manager import PeerManager
+from pending import PendingObjects
 
 logger = logging.getLogger('KermaNode')
 
@@ -42,6 +43,8 @@ class KermaNode:
         self.active_outbound = set()
         # Connections with a completed handshake (receivers of gossip).
         self.connections: Set[ConnectionHandler] = set()
+        # Validations that wait for other objects (shared by all connections).
+        self.pending = PendingObjects()
         self._tasks = set()
 
     def _spawn(self, coro) -> None:

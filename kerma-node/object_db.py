@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import sqlite3
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set, Tuple
 
 from objects import GENESIS_BLOCK, GENESIS_ID, canonical_json, object_id
 
@@ -34,9 +34,17 @@ class ObjectDB:
             '  data TEXT NOT NULL'
             ')'
         )
+        # Height and UTXO set after each stored (valid) block.
+        self.conn.execute(
+            'CREATE TABLE IF NOT EXISTS block_state ('
+            '  blockid TEXT PRIMARY KEY,'
+            '  height INTEGER NOT NULL,'
+            '  utxo TEXT NOT NULL'
+            ')'
+        )
         self.conn.commit()
         assert object_id(GENESIS_BLOCK) == GENESIS_ID, 'genesis block id mismatch'
-        self.put(GENESIS_BLOCK)
+        self.put_block(GENESIS_BLOCK, 0, set())
         logger.info(f'Object database {self.path} contains {self.count()} objects')
 
     def has(self, oid: str) -> bool:
@@ -55,13 +63,38 @@ class ObjectDB:
 
     def put(self, obj: Dict[str, Any]) -> str:
         """Store obj under its objectid (no-op if already stored) and return the id."""
+        oid = self._insert(obj)
+        self.conn.commit()
+        return oid
+
+    def _insert(self, obj: Dict[str, Any]) -> str:
         oid = object_id(obj)
         self.conn.execute(
             'INSERT OR IGNORE INTO objects (objectid, type, data) VALUES (?, ?, ?)',
             (oid, str(obj.get('type')), canonical_json(obj).decode('utf-8')),
         )
+        return oid
+
+    def put_block(
+            self, block: Dict[str, Any], height: int, utxo: Set[Tuple[str, int]]
+    ) -> str:
+        """Store a validated block together with its height and UTXO set (atomically)."""
+        oid = self._insert(block)
+        self.conn.execute(
+            'INSERT OR IGNORE INTO block_state (blockid, height, utxo) VALUES (?, ?, ?)',
+            (oid, height, json.dumps(sorted([t, i] for t, i in utxo))),
+        )
         self.conn.commit()
         return oid
+
+    def get_block_state(self, blockid: str) -> Optional[Tuple[int, Set[Tuple[str, int]]]]:
+        """Return (height, UTXO set after the block) for a stored block, or None."""
+        row = self.conn.execute(
+            'SELECT height, utxo FROM block_state WHERE blockid = ?', (blockid,)
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0], {(t, i) for t, i in json.loads(row[1])}
 
     def count(self) -> int:
         """Return the number of stored objects."""

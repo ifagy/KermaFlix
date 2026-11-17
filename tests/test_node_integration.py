@@ -12,7 +12,9 @@ import unittest
 
 import helpers  # noqa: F401  (sets up the import path)
 from helpers import (
-    EXAMPLE_COINBASE, EXAMPLE_COINBASE_ID, EXAMPLE_TX, EXAMPLE_TX_ID, Wallet, coinbase, spend,
+    BLOCK_REWARD, EXAMPLE_BLOCK, EXAMPLE_BLOCK_ID, EXAMPLE_CB_H1, EXAMPLE_CB_H1_ID,
+    EXAMPLE_COINBASE, EXAMPLE_COINBASE_ID, EXAMPLE_TX, EXAMPLE_TX_ID, GENESIS_CREATED,
+    Wallet, coinbase, make_block, mine, spend, unmine,
 )
 from node import KermaNode
 from object_db import ObjectDB
@@ -287,9 +289,165 @@ class NodeIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await g2.read_type('ihaveobject'))['objectid'], object_id(obj))
         self.assertTrue(await g1.is_alive())
 
-    async def test_block_object_is_invalid_format(self):
-        block = dict(GENESIS_BLOCK, created=1671062401)
-        await self._expect_rejected(block, 'INVALID_FORMAT')
+    async def test_valid_block_with_known_tx_accepted_and_gossiped(self):
+        g1, g2 = await self.grader(), await self.grader()
+        await g1.send({'type': 'object', 'object': EXAMPLE_CB_H1})
+        self.assertEqual((await g2.read_type('ihaveobject'))['objectid'], EXAMPLE_CB_H1_ID)
+        await g1.send({'type': 'object', 'object': EXAMPLE_BLOCK})
+        self.assertEqual((await g2.read_type('ihaveobject'))['objectid'], EXAMPLE_BLOCK_ID)
+        self.assertEqual(
+            self.node.object_db.get_block_state(EXAMPLE_BLOCK_ID),
+            (1, {(EXAMPLE_CB_H1_ID, 0)}),
+        )
+
+    async def test_block_fetches_missing_transaction_and_validates(self):
+        g1, g2 = await self.grader(), await self.grader()
+        # Send block BEFORE its transaction; node must request the tx with getobject.
+        await g1.send({'type': 'object', 'object': EXAMPLE_BLOCK})
+        req = await g1.read_type('getobject')
+        self.assertEqual(req, {'type': 'getobject', 'objectid': EXAMPLE_CB_H1_ID})
+        await g1.send({'type': 'object', 'object': EXAMPLE_CB_H1})
+        # Both the tx and the block must be gossiped to g2.
+        ihave1 = (await g2.read_type('ihaveobject'))['objectid']
+        ihave2 = (await g2.read_type('ihaveobject'))['objectid']
+        self.assertEqual({ihave1, ihave2}, {EXAMPLE_CB_H1_ID, EXAMPLE_BLOCK_ID})
+        self.assertTrue(self.node.object_db.has(EXAMPLE_BLOCK_ID))
+
+    async def test_block_missing_tx_timeout_gives_unfindable_object(self):
+        import connection
+        old_timeout = connection.TX_FETCH_TIMEOUT
+        connection.TX_FETCH_TIMEOUT = 0.3
+        try:
+            g1, g2 = await self.grader(), await self.grader()
+            await g1.send({'type': 'object', 'object': EXAMPLE_BLOCK})
+            req = await g1.read_type('getobject')
+            self.assertEqual(req['objectid'], EXAMPLE_CB_H1_ID)
+            # Node also requested the missing tx from g2 (all connected peers).
+            req2 = await g2.read_type('getobject')
+            self.assertEqual(req2['objectid'], EXAMPLE_CB_H1_ID)
+            err = await g1.read_type('error')
+            self.assertEqual(err['name'], 'UNFINDABLE_OBJECT')
+            # UNFINDABLE_OBJECT is non-fatal: connection stays alive, block not stored/gossiped.
+            self.assertTrue(await g1.is_alive())
+            await g2.expect_silence(0.2)
+            self.assertFalse(self.node.object_db.has(EXAMPLE_BLOCK_ID))
+        finally:
+            connection.TX_FETCH_TIMEOUT = old_timeout
+
+    async def test_block_with_invalid_fetched_tx_gives_invalid_ancestry(self):
+        g1, g2 = await self.grader(), await self.grader()
+        alice, bob = Wallet(), Wallet()
+        cb = coinbase(alice.pubkey, 100, height=1)
+        b1 = make_block([object_id(cb)])
+        await self._store(cb)
+        self.node.object_db.put_block(b1, 1, {(object_id(cb), 0)})
+
+        # Create an invalid transaction (wrong signature) and a valid-PoW block referencing it.
+        bad_tx = spend([(object_id(cb), 0, bob)], [(bob.pubkey, 50)])
+        b2 = make_block([object_id(bad_tx)], previd=object_id(b1), created=b1['created'] + 1)
+
+        await g1.send({'type': 'object', 'object': b2})
+        req = await g1.read_type('getobject')
+        self.assertEqual(req['objectid'], object_id(bad_tx))
+        req2 = await g2.read_type('getobject')
+        self.assertEqual(req2['objectid'], object_id(bad_tx))
+        await g1.send({'type': 'object', 'object': bad_tx})
+
+        err1 = await g1.read_type('error')
+        err2 = await g1.read_type('error')
+        self.assertEqual({err1['name'], err2['name']}, {'INVALID_TX_SIGNATURE', 'INVALID_ANCESTRY'})
+        await g1.expect_closed()
+        await g2.expect_silence(0.2)
+        self.assertFalse(self.node.object_db.has(object_id(b2)))
+
+    async def test_block_unknown_parent_gives_unknown_object(self):
+        g1, g2 = await self.grader(), await self.grader()
+        block = make_block([], previd='ee' * 32)
+        await g1.send({'type': 'object', 'object': block})
+        err = await g1.read_type('error')
+        self.assertEqual(err['name'], 'UNKNOWN_OBJECT')
+        self.assertTrue(await g1.is_alive())
+        await g2.expect_silence(0.2)
+        self.assertFalse(self.node.object_db.has(object_id(block)))
+
+    async def test_invalid_blocks_rejected_and_not_gossiped(self):
+        alice, bob = Wallet(), Wallet()
+        cb1 = coinbase(alice.pubkey, 100, height=1)
+        cb1_id = object_id(cb1)
+        b1 = make_block([cb1_id], previd=GENESIS_ID, created=GENESIS_CREATED + 1)
+        b1_id = object_id(b1)
+        await self._store(cb1)
+        self.node.object_db.put_block(b1, 1, {(cb1_id, 0)})
+
+        # Unconfirmed coinbase for testing outpoint-not-in-utxo
+        unconfirmed_cb = coinbase(alice.pubkey, 100, height=99)
+        await self._store(unconfirmed_cb)
+        spend_unconfirmed = spend([(object_id(unconfirmed_cb), 0, alice)], [(bob.pubkey, 50)])
+        await self._store(spend_unconfirmed)
+
+        # Double spend transactions in same block
+        ds1 = spend([(cb1_id, 0, alice)], [(bob.pubkey, 40)])
+        ds2 = spend([(cb1_id, 0, alice)], [(alice.pubkey, 40)])
+        await self._store(ds1, ds2)
+
+        # Spend coinbase of same block
+        cb2 = coinbase(alice.pubkey, BLOCK_REWARD, height=2)
+        spend_same_cb = spend([(object_id(cb2), 0, alice)], [(bob.pubkey, 10)])
+        await self._store(cb2, spend_same_cb)
+
+        # Coinbase exceeds reward + fee
+        cb_greedy = coinbase(bob.pubkey, BLOCK_REWARD + 1, height=2)
+        await self._store(cb_greedy)
+
+        # Coinbase wrong height
+        cb_bad_height = coinbase(bob.pubkey, BLOCK_REWARD, height=5)
+        await self._store(cb_bad_height)
+
+        cases = [
+            ('wrong target', mine(dict(EXAMPLE_BLOCK, T='0000abd' + '0' * 57)), 'INVALID_FORMAT'),
+            ('invalid pow', unmine(EXAMPLE_BLOCK), 'INVALID_BLOCK_POW'),
+            ('fake genesis', make_block([], previd=None), 'INVALID_GENESIS'),
+            ('timestamp <= parent', make_block([], previd=b1_id, created=b1['created']),
+             'INVALID_BLOCK_TIMESTAMP'),
+            ('timestamp in future', make_block([], previd=b1_id, created=10 ** 12),
+             'INVALID_BLOCK_TIMESTAMP'),
+            ('double spend in block',
+             make_block([object_id(ds1), object_id(ds2)], previd=b1_id, created=b1['created'] + 1),
+             'INVALID_TX_OUTPOINT'),
+            ('spend not in utxo',
+             make_block([object_id(spend_unconfirmed)], previd=b1_id, created=b1['created'] + 1),
+             'INVALID_TX_OUTPOINT'),
+            ('spend same-block coinbase',
+             make_block([object_id(cb2), object_id(spend_same_cb)], previd=b1_id, created=b1['created'] + 1),
+             'INVALID_TX_OUTPOINT'),
+            ('coinbase exceeds reward',
+             make_block([object_id(cb_greedy)], previd=b1_id, created=b1['created'] + 1),
+             'INVALID_BLOCK_COINBASE'),
+            ('coinbase wrong height',
+             make_block([object_id(cb_bad_height)], previd=b1_id, created=b1['created'] + 1),
+             'INVALID_BLOCK_COINBASE'),
+        ]
+        for desc, bad_block, err_name in cases:
+            with self.subTest(desc=desc):
+                await self._expect_rejected(bad_block, err_name)
+
+    async def test_multi_block_chain_utxo_execution(self):
+        g1, g2 = await self.grader(), await self.grader()
+        alice, bob = Wallet(), Wallet()
+        cb1 = coinbase(alice.pubkey, BLOCK_REWARD, height=1)
+        b1 = make_block([object_id(cb1)], previd=GENESIS_ID, created=GENESIS_CREATED + 1)
+
+        tx1 = spend([(object_id(cb1), 0, alice)], [(bob.pubkey, 1000), (alice.pubkey, BLOCK_REWARD - 1500)])
+        cb2 = coinbase(bob.pubkey, BLOCK_REWARD + 500, height=2)
+        b2 = make_block([object_id(cb2), object_id(tx1)], previd=object_id(b1), created=b1['created'] + 1)
+
+        for obj in (cb1, b1, tx1, cb2, b2):
+            await g1.send({'type': 'object', 'object': obj})
+            self.assertEqual((await g2.read_type('ihaveobject'))['objectid'], object_id(obj))
+
+        height, utxo = self.node.object_db.get_block_state(object_id(b2))
+        self.assertEqual(height, 2)
+        self.assertEqual(utxo, {(object_id(cb2), 0), (object_id(tx1), 0), (object_id(tx1), 1)})
 
     async def test_unhandled_message_types_still_ignored(self):
         g1 = await self.grader()

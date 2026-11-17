@@ -6,6 +6,7 @@ Start the node first, e.g.:
 
 Then run the tests from the project root:
 
+
     python auto_test.py            # all fast tests
     python auto_test.py --slow     # additionally runs the 20 s handshake timeout test
 
@@ -708,22 +709,6 @@ def test_known_object_not_gossiped_again():
     request_peers(g1)
 
 
-def test_non_transaction_object_gives_invalid_format():
-    """Receiving an object with type != 'transaction' gives INVALID_FORMAT."""
-    c = handshake()
-    send_object(c, {
-        'T': '0000abc000000000000000000000000000000000000000000000000000000000',
-        'created': 1671062401,
-        'miner': 'Marabu',
-        'nonce': '00000000000000000000000000000000000000000000000000000000005bb0f2',
-        'note': 'non-genesis block',
-        'previd': GENESIS_ID,
-        'txids': [],
-        'type': 'block',
-    })
-    expect_error(c, 'INVALID_FORMAT')
-
-
 TASK2_TESTS = [
     test_genesis_block_available,
     test_example_transactions_accepted,
@@ -737,7 +722,258 @@ TASK2_TESTS = [
     test_invalid_transactions_rejected_and_not_gossiped,
     test_unknown_outpoint_keeps_connection,
     test_known_object_not_gossiped_again,
-    test_non_transaction_object_gives_invalid_format,
+]
+
+
+# ---------------------------------------------------------------------------
+# Task 3: block validation, transaction fetching and UTXO execution
+# ---------------------------------------------------------------------------
+
+TARGET = '0000abc000000000000000000000000000000000000000000000000000000000'
+GENESIS_CREATED = 1671062400
+BLOCK_REWARD = 50 * 10 ** 12
+
+EXAMPLE_CB_H1 = {
+    'height': 1,
+    'outputs': [{
+        'pubkey': '3f0bc71a375b574e4bda3ddf502fe1afd99aa020bf6049adfe525d9ad18ff33f',
+        'value': 50000000000000,
+    }],
+    'type': 'transaction',
+}
+EXAMPLE_CB_H1_ID = '6ebfb4c8e8e9b19dcf54c6ce3e1e143da1f473ea986e70c5cb8899a4671c933a'
+EXAMPLE_BLOCK = {
+    'T': TARGET,
+    'created': 1671148800,
+    'miner': 'grader',
+    'nonce': '00000000000000000000000000000000000000000000000000000000000463cf',
+    'note': 'This block has a coinbase transaction',
+    'previd': GENESIS_ID,
+    'txids': [EXAMPLE_CB_H1_ID],
+    'type': 'block',
+}
+EXAMPLE_BLOCK_ID = '000020cb0002575a71955763adf365c78182f0bb5bee767794ebc7346e0a2194'
+
+_NONCE_MARKER = 'n' * 64
+
+
+def mine_block(block):
+    """Return a copy of block with a valid proof-of-work nonce."""
+    import hashlib
+    template = canonical(dict(block, nonce=_NONCE_MARKER))
+    prefix, suffix = template.split(_NONCE_MARKER.encode())
+    base = hashlib.blake2s(prefix)
+    target = bytes.fromhex(TARGET)
+    n = random.getrandbits(64) << 128
+    while True:
+        nonce = b'%064x' % n
+        h = base.copy()
+        h.update(nonce + suffix)
+        if h.digest() < target:
+            return dict(block, nonce=nonce.decode())
+        n += 1
+
+
+def unmine_block(block):
+    """Return a copy of block with an invalid proof-of-work nonce."""
+    import hashlib
+    target = bytes.fromhex(TARGET)
+    n = 0
+    while True:
+        cand = dict(block, nonce='%064x' % n)
+        if hashlib.blake2s(canonical(cand)).digest() >= target:
+            return cand
+        n += 1
+
+
+def make_block(txids=(), previd=GENESIS_ID, created=None, do_mine=True, **extra):
+    """Build (and optionally mine) a block."""
+    block = {
+        'type': 'block',
+        'txids': list(txids),
+        'nonce': '0' * 64,
+        'previd': previd,
+        'created': GENESIS_CREATED + 1 if created is None else created,
+        'T': TARGET,
+        'miner': 'auto-test',
+        'note': ''.join(random.choices(string.ascii_lowercase, k=12)),
+    }
+    block.update(extra)
+    return mine_block(block) if do_mine else block
+
+
+def test_task3_example_block_accepted():
+    """The example coinbase and block from the Task 3 description are accepted."""
+    c = handshake()
+    send_object(c, EXAMPLE_CB_H1)
+    check(get_object(c, EXAMPLE_CB_H1_ID) == EXAMPLE_CB_H1, 'Task 3 example coinbase not stored')
+    send_object(c, EXAMPLE_BLOCK)
+    check(get_object(c, EXAMPLE_BLOCK_ID) == EXAMPLE_BLOCK, 'Task 3 example block not stored')
+
+
+def test_valid_block_gossiped():
+    """A new valid block sent by Grader 1 is gossiped to Grader 2."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    w = Wallet()
+    cb = {'type': 'transaction', 'height': 1, 'outputs': [{'pubkey': w.pubkey, 'value': BLOCK_REWARD}]}
+    send_object(g1, cb)
+    expect_ihave(g2, object_id(cb))
+    b1 = make_block([object_id(cb)])
+    send_object(g1, b1)
+    expect_ihave(g2, object_id(b1))
+    check(get_object(g2, object_id(b1)) == b1, 'Grader 2 could not fetch the stored block')
+
+
+def test_block_fetches_missing_transaction():
+    """When a block references an unknown tx, the node requests it via getobject and validates."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    w = Wallet()
+    cb = {'type': 'transaction', 'height': 1, 'outputs': [{'pubkey': w.pubkey, 'value': BLOCK_REWARD}]}
+    cb_id = object_id(cb)
+    b1 = make_block([cb_id])
+    b1_id = object_id(b1)
+
+    send_object(g1, b1)
+    req = read_type(g1, 'getobject')
+    check(req == {'type': 'getobject', 'objectid': cb_id}, f'expected getobject for {cb_id}, got {req}')
+    send_object(g1, cb)
+
+    expect_ihave(g2, b1_id)
+    check(get_object(g1, b1_id) == b1, 'block was not stored after tx arrived')
+
+
+def test_block_with_invalid_fetched_tx_gives_invalid_ancestry():
+    """If a fetched transaction in a block turns out to be invalid, INVALID_ANCESTRY is sent."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    alice, bob = Wallet(), Wallet()
+    cb = {'type': 'transaction', 'height': 1, 'outputs': [{'pubkey': alice.pubkey, 'value': 100}]}
+    cb_id = object_id(cb)
+    b1 = make_block([cb_id])
+    b1_id = object_id(b1)
+    send_object(g1, cb)
+    send_object(g1, b1)
+    expect_ihave(g2, b1_id)
+
+    bad_tx = signed_tx([(cb_id, 0, bob)], [(bob.pubkey, 50)])  # signed with wrong key
+    bad_tx_id = object_id(bad_tx)
+    b2 = make_block([bad_tx_id], previd=b1_id, created=b1['created'] + 1)
+    b2_id = object_id(b2)
+
+    send_object(g1, b2)
+    req = read_type(g1, 'getobject')
+    check(req['objectid'] == bad_tx_id, f'expected getobject for {bad_tx_id}, got {req}')
+    send_object(g1, bad_tx)
+
+    err1 = read_type(g1, 'error')
+    err2 = read_type(g1, 'error')
+    check(
+        {err1.get('name'), err2.get('name')} == {'INVALID_TX_SIGNATURE', 'INVALID_ANCESTRY'},
+        f'expected INVALID_TX_SIGNATURE and INVALID_ANCESTRY, got {err1} and {err2}',
+    )
+    g1.expect_closed()
+    expect_no_ihave(g2, b2_id)
+
+
+def test_block_unknown_parent_gives_unknown_object():
+    """A block whose parent is not known gives UNKNOWN_OBJECT without closing."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    b = make_block([], previd='ee' * 32)
+    send_object(g1, b)
+    err = read_type(g1, 'error')
+    check(err.get('name') == 'UNKNOWN_OBJECT', f'expected UNKNOWN_OBJECT, got {err}')
+    request_peers(g1)
+    expect_no_ihave(g2, object_id(b))
+
+
+def test_invalid_blocks_rejected_and_not_gossiped():
+    """Invalid blocks give the right error, close the connection and are not gossiped."""
+    setup = handshake()
+    alice, bob = Wallet(), Wallet()
+    cb1 = {'type': 'transaction', 'height': 1, 'outputs': [{'pubkey': alice.pubkey, 'value': 100}]}
+    cb1_id = object_id(cb1)
+    b1 = make_block([cb1_id], previd=GENESIS_ID, created=GENESIS_CREATED + 1)
+    b1_id = object_id(b1)
+    send_object(setup, cb1)
+    send_object(setup, b1)
+    check(get_object(setup, b1_id) == b1, 'setup block not stored')
+
+    unconfirmed_cb = new_coinbase(alice, value=100)
+    spend_unconfirmed = signed_tx([(object_id(unconfirmed_cb), 0, alice)], [(bob.pubkey, 50)])
+    ds1 = signed_tx([(cb1_id, 0, alice)], [(bob.pubkey, 40)])
+    ds2 = signed_tx([(cb1_id, 0, alice)], [(alice.pubkey, 40)])
+    cb2 = {'type': 'transaction', 'height': 2, 'outputs': [{'pubkey': alice.pubkey, 'value': BLOCK_REWARD}]}
+    spend_same_cb = signed_tx([(object_id(cb2), 0, alice)], [(bob.pubkey, 10)])
+    cb_greedy = {'type': 'transaction', 'height': 2, 'outputs': [{'pubkey': bob.pubkey, 'value': BLOCK_REWARD + 1}]}
+    cb_bad_height = {'type': 'transaction', 'height': 9, 'outputs': [{'pubkey': bob.pubkey, 'value': BLOCK_REWARD}]}
+
+    for obj in (unconfirmed_cb, spend_unconfirmed, ds1, ds2, cb2, spend_same_cb, cb_greedy, cb_bad_height):
+        send_object(setup, obj)
+        get_object(setup, object_id(obj))
+
+    cases = [
+        ('wrong target', mine_block(dict(EXAMPLE_BLOCK, T='0000abd' + '0' * 57)), 'INVALID_FORMAT'),
+        ('invalid pow', unmine_block(EXAMPLE_BLOCK), 'INVALID_BLOCK_POW'),
+        ('fake genesis', make_block([], previd=None), 'INVALID_GENESIS'),
+        ('timestamp <= parent', make_block([], previd=b1_id, created=b1['created']),
+         'INVALID_BLOCK_TIMESTAMP'),
+        ('timestamp in future', make_block([], previd=b1_id, created=10 ** 12),
+         'INVALID_BLOCK_TIMESTAMP'),
+        ('double spend in block',
+         make_block([object_id(ds1), object_id(ds2)], previd=b1_id, created=b1['created'] + 1),
+         'INVALID_TX_OUTPOINT'),
+        ('spend not in utxo',
+         make_block([object_id(spend_unconfirmed)], previd=b1_id, created=b1['created'] + 1),
+         'INVALID_TX_OUTPOINT'),
+        ('spend same-block coinbase',
+         make_block([object_id(cb2), object_id(spend_same_cb)], previd=b1_id, created=b1['created'] + 1),
+         'INVALID_TX_OUTPOINT'),
+        ('coinbase exceeds reward',
+         make_block([object_id(cb_greedy)], previd=b1_id, created=b1['created'] + 1),
+         'INVALID_BLOCK_COINBASE'),
+        ('coinbase wrong height',
+         make_block([object_id(cb_bad_height)], previd=b1_id, created=b1['created'] + 1),
+         'INVALID_BLOCK_COINBASE'),
+    ]
+
+    for desc, bad_block, error in cases:
+        g1, g2 = handshake(), handshake()
+        request_peers(g2)
+        send_object(g1, bad_block)
+        try:
+            expect_error(g1, error)
+            expect_no_ihave(g2, object_id(bad_block))
+        except AssertionError as e:
+            raise AssertionError(f'{desc}: {e}')
+        g1.close()
+        g2.close()
+
+
+def test_block_missing_tx_timeout_unfindable():
+    """A block whose transaction does not arrive within 5s gives UNFINDABLE_OBJECT (slow)."""
+    g1, g2 = handshake(), handshake()
+    request_peers(g2)
+    missing_txid = object_id({'nonexistent': random.random()})
+    b = make_block([missing_txid])
+    send_object(g1, b)
+    req = read_type(g1, 'getobject')
+    check(req == {'type': 'getobject', 'objectid': missing_txid}, f'unexpected getobject: {req}')
+    err = read_type(g1, 'error', timeout=7.0)
+    check(err.get('name') == 'UNFINDABLE_OBJECT', f'expected UNFINDABLE_OBJECT, got {err}')
+    request_peers(g1)  # connection stays open
+    expect_no_ihave(g2, object_id(b))
+
+
+TASK3_TESTS = [
+    test_task3_example_block_accepted,
+    test_valid_block_gossiped,
+    test_block_fetches_missing_transaction,
+    test_block_with_invalid_fetched_tx_gives_invalid_ancestry,
+    test_block_unknown_parent_gives_unknown_object,
+    test_invalid_blocks_rejected_and_not_gossiped,
 ]
 
 
@@ -772,8 +1008,9 @@ def main():
         print(f'Cannot connect to {HOST}:{PORT} ({e}). Is the node running?')
         sys.exit(2)
 
-    tests = list(FAST_TESTS) + TASK2_TESTS
+    tests = list(FAST_TESTS) + TASK2_TESTS + TASK3_TESTS
     if '--slow' in sys.argv:
+        tests.append(test_block_missing_tx_timeout_unfindable)
         tests.append(test_handshake_timeout)
 
     failed = []

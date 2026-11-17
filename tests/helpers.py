@@ -103,3 +103,85 @@ class DictDB:
 
     def get(self, oid):
         return self.data.get(oid)
+
+    def add(self, *objs):
+        from objects import object_id
+        for o in objs:
+            self.data[object_id(o)] = o
+
+
+# ---------- Blocks (Task 3) ----------
+
+TARGET = '0000abc000000000000000000000000000000000000000000000000000000000'
+GENESIS_ID = '00002fa163c7dab0991544424b9fd302bb1782b185e5a3bbdf12afb758e57dee'
+GENESIS_CREATED = 1671062400
+BLOCK_REWARD = 50 * 10 ** 12
+
+# Example objects from the Task 3 description.
+EXAMPLE_CB_H1 = {
+    'height': 1,
+    'outputs': [{
+        'pubkey': '3f0bc71a375b574e4bda3ddf502fe1afd99aa020bf6049adfe525d9ad18ff33f',
+        'value': 50000000000000,
+    }],
+    'type': 'transaction',
+}
+EXAMPLE_CB_H1_ID = '6ebfb4c8e8e9b19dcf54c6ce3e1e143da1f473ea986e70c5cb8899a4671c933a'
+EXAMPLE_BLOCK = {
+    'T': TARGET,
+    'created': 1671148800,
+    'miner': 'grader',
+    'nonce': '00000000000000000000000000000000000000000000000000000000000463cf',
+    'note': 'This block has a coinbase transaction',
+    'previd': GENESIS_ID,
+    'txids': [EXAMPLE_CB_H1_ID],
+    'type': 'block',
+}
+EXAMPLE_BLOCK_ID = '000020cb0002575a71955763adf365c78182f0bb5bee767794ebc7346e0a2194'
+
+_NONCE_MARKER = 'n' * 64  # not hex, so it cannot collide with other values
+
+
+def mine(block: dict) -> dict:
+    """Return a copy of block with a nonce that satisfies the proof-of-work."""
+    import hashlib
+    import random
+    template = canonical_json(dict(block, nonce=_NONCE_MARKER))
+    prefix, suffix = template.split(_NONCE_MARKER.encode())
+    base = hashlib.blake2s(prefix)
+    target = bytes.fromhex(TARGET)
+    n = random.getrandbits(64) << 128
+    while True:
+        nonce = b'%064x' % n
+        h = base.copy()
+        h.update(nonce + suffix)
+        if h.digest() < target:
+            return dict(block, nonce=nonce.decode())
+        n += 1
+
+
+def unmine(block: dict) -> dict:
+    """Return a copy of block whose proof-of-work is NOT valid."""
+    import hashlib
+    target = bytes.fromhex(TARGET)
+    n = 0
+    while True:
+        candidate = dict(block, nonce='%064x' % n)
+        if hashlib.blake2s(canonical_json(candidate)).digest() >= target:
+            return candidate
+        n += 1
+
+
+def make_block(txids=(), previd=GENESIS_ID, created=None, do_mine=True, **extra) -> dict:
+    """Build a block (mined by default). created defaults to one second after genesis."""
+    block = {
+        'type': 'block',
+        'txids': list(txids),
+        'nonce': '0' * 64,
+        'previd': previd,
+        'created': GENESIS_CREATED + 1 if created is None else created,
+        'T': TARGET,
+        'miner': 'unit-test',
+    }
+    block.update(extra)
+    return mine(block) if do_mine else block

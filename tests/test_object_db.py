@@ -5,7 +5,10 @@ import tempfile
 import unittest
 
 import helpers  # noqa: F401  (sets up the import path)
-from helpers import EXAMPLE_COINBASE, EXAMPLE_COINBASE_ID, EXAMPLE_TX, EXAMPLE_TX_ID
+from helpers import (
+    EXAMPLE_BLOCK, EXAMPLE_BLOCK_ID, EXAMPLE_CB_H1_ID, EXAMPLE_COINBASE, EXAMPLE_COINBASE_ID,
+    EXAMPLE_TX, EXAMPLE_TX_ID,
+)
 from object_db import ObjectDB
 from objects import GENESIS_BLOCK, GENESIS_ID
 
@@ -54,6 +57,30 @@ class ObjectDBTest(unittest.TestCase):
         self.db = ObjectDB(self.path)
         self.assertEqual(self.db.get(EXAMPLE_COINBASE_ID), EXAMPLE_COINBASE)
         self.assertEqual(self.db.count(), 2)  # genesis not duplicated
+
+    # ---------- Block state (Task 3) ----------
+
+    def test_genesis_state(self):
+        self.assertEqual(self.db.get_block_state(GENESIS_ID), (0, set()))
+
+    def test_no_state_for_transactions_or_unknown(self):
+        self.db.put(EXAMPLE_COINBASE)
+        self.assertIsNone(self.db.get_block_state(EXAMPLE_COINBASE_ID))
+        self.assertIsNone(self.db.get_block_state('ee' * 32))
+
+    def test_put_block_stores_object_and_state(self):
+        utxo = {(EXAMPLE_CB_H1_ID, 0), ('ab' * 32, 3)}
+        oid = self.db.put_block(EXAMPLE_BLOCK, 1, utxo)
+        self.assertEqual(oid, EXAMPLE_BLOCK_ID)
+        self.assertEqual(self.db.get(EXAMPLE_BLOCK_ID), EXAMPLE_BLOCK)
+        self.assertEqual(self.db.get_block_state(EXAMPLE_BLOCK_ID), (1, utxo))
+
+    def test_block_state_survives_restart(self):
+        self.db.put_block(EXAMPLE_BLOCK, 1, {(EXAMPLE_CB_H1_ID, 0)})
+        self.db.close()
+        self.db = ObjectDB(self.path)
+        self.assertEqual(self.db.get_block_state(EXAMPLE_BLOCK_ID), (1, {(EXAMPLE_CB_H1_ID, 0)}))
+        self.assertEqual(self.db.get_block_state(GENESIS_ID), (0, set()))
 
 
 if __name__ == '__main__':

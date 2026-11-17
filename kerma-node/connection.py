@@ -3,9 +3,12 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Optional, Tuple
 
+from blocks import execute_block, validate_block_header
 from objects import KermaError, object_id, validate_transaction
+from pending import INVALID, UNFINDABLE, VALID, PendingObjects
 from protocol import serialize_canonical_json, validate_message
 
 logger = logging.getLogger('Connection')
@@ -14,6 +17,10 @@ logger = logging.getLogger('Connection')
 HANDSHAKE_TIMEOUT = 20.0
 # Maximum length of a single message line in bytes.
 STREAM_LIMIT = 1024 * 1024
+# Seconds to wait for the missing transactions of a block.
+TX_FETCH_TIMEOUT = 5.0
+# Seconds to wait for a parent block that is still being validated.
+PARENT_TIMEOUT = 10.0
 
 
 def _reject_constant(name: str):
@@ -48,6 +55,8 @@ class ConnectionHandler:
         self.remote_peer_str = remote_peer_str
         self.object_db = object_db
         self.network = network
+        # Shared bookkeeping of validations that wait for other objects.
+        self.pending = getattr(network, 'pending', None) or PendingObjects()
         self.handshake_done = False
         self.is_closed = False
         self.label = remote_peer_str or str(writer.get_extra_info('peername'))
@@ -220,18 +229,33 @@ class ConnectionHandler:
                 )
 
             elif msg_type in ('getobject', 'ihaveobject', 'object'):
+                oid = object_id(msg['object']) if msg_type == 'object' else None
                 try:
                     await self._handle_object_message(msg)
                 except KermaError as e:
+                    await self._report_error(e, oid)
                     if e.fatal:
-                        await self.send_error_and_close(e.name, e.msg)
                         return
-                    logger.info(f'[{self.label}] Sending {e.name} ({e.msg})')
-                    await self.send_msg({'type': 'error', 'name': e.name, 'msg': e.msg})
 
             else:
                 # Valid message types without handling are ignored.
                 logger.debug(f'[{self.label}] Ignoring message type: {msg_type}')
+
+    async def _report_error(self, e: KermaError, oid: Optional[str] = None) -> None:
+        """Send an error for an object (oid) to the peer.
+
+        Validations waiting for oid are notified first, so that their errors
+        (INVALID_ANCESTRY / UNFINDABLE_OBJECT) are still sent. For fatal errors
+        the connection is closed afterwards (and an outbound peer is forgotten).
+        """
+        logger.warning(f'[{self.label}] Sending {e.name} ({e.msg})')
+        await self.send_msg({'type': 'error', 'name': e.name, 'msg': e.msg})
+        if oid is not None:
+            await self.pending.fail(oid, INVALID if e.fatal else UNFINDABLE)
+        if e.fatal:
+            if self.is_outbound and self.remote_peer_str:
+                self.peer_manager.remove_peer(self.remote_peer_str)
+            self.close()
 
     # ---------- Object exchange ----------
 
@@ -267,14 +291,102 @@ class ConnectionHandler:
             return
 
         obj_type = obj.get('type')
-        if obj_type != 'transaction':
-            raise KermaError('INVALID_FORMAT', f'Unsupported object type {obj_type!r}')
+        if obj_type == 'transaction':
+            validate_transaction(obj, self.object_db)
+            self.object_db.put(obj)
+            await self._object_stored(oid, obj_type)
+        elif obj_type == 'block':
+            await self._receive_block(obj, oid)
+        else:
+            raise KermaError('INVALID_FORMAT', f'Unknown object type {obj_type!r}')
 
-        validate_transaction(obj, self.object_db)
-
-        self.object_db.put(obj)
+    async def _object_stored(self, oid: str, obj_type: str) -> None:
+        """Notify waiting validations about a new valid object and gossip it."""
         logger.info(f'[{self.label}] Stored new valid {obj_type} {oid}')
+        self.pending.resolve(oid, VALID)
+        await self._broadcast({'type': 'ihaveobject', 'objectid': oid})
+
+    async def _broadcast(self, msg: dict) -> None:
+        """Send msg to all connected peers (or only this peer without a network)."""
         if self.network is not None:
-            await self.network.broadcast(
-                {'type': 'ihaveobject', 'objectid': oid}
-            )
+            await self.network.broadcast(msg)
+        else:
+            await self.send_msg(msg)
+
+    # ---------- Blocks ----------
+
+    async def _receive_block(self, block: dict, oid: str) -> None:
+        """Validate a new block; fetch missing transactions if necessary.
+
+        If the parent and all transactions are known, the block is validated
+        right away. Otherwise validation continues in the background and the
+        result (stored + gossiped, or an error) is reported later.
+        """
+        validate_block_header(block, oid)
+        if self.pending.in_progress(oid):
+            return  # the same block is already being validated
+
+        previd = block['previd']
+        parent_known = self.object_db.has(previd)
+        if not parent_known and not self.pending.in_progress(previd):
+            raise KermaError('UNKNOWN_OBJECT', f'Parent block {previd} is not known')
+
+        missing = [t for t in dict.fromkeys(block['txids']) if not self.object_db.has(t)]
+        if parent_known and not missing:
+            await self._finish_block(block, oid)
+            return
+
+        self.pending.start(oid)
+        self._spawn(self._validate_block_later(block, oid, missing))
+
+    async def _validate_block_later(self, block: dict, oid: str, missing: list) -> None:
+        """Wait for the parent and the missing transactions, then finish validation."""
+        try:
+            previd = block['previd']
+            if not self.object_db.has(previd):
+                if not self.pending.in_progress(previd):
+                    raise KermaError(
+                        'UNFINDABLE_OBJECT', f'Parent block {previd} could not be verified'
+                    )
+                await self.pending.wait_all([previd], PARENT_TIMEOUT)
+
+            missing = [t for t in missing if not self.object_db.has(t)]
+            if missing:
+                async def request_missing():
+                    for txid in missing:
+                        await self._broadcast({'type': 'getobject', 'objectid': txid})
+
+                await self.pending.wait_all(missing, TX_FETCH_TIMEOUT, request_missing)
+
+            await self._finish_block(block, oid)
+        except KermaError as e:
+            await self._report_error(e, oid)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(f'[{self.label}] Unexpected error validating block {oid}')
+            self.pending.resolve(oid, UNFINDABLE)
+
+    async def _finish_block(self, block: dict, oid: str) -> None:
+        """Execute the block on its parent's UTXO set; store and gossip it if valid."""
+        previd = block['previd']
+        parent = self.object_db.get(previd)
+        state = self.object_db.get_block_state(previd)
+        if parent is None or parent.get('type') != 'block' or state is None:
+            raise KermaError('INVALID_FORMAT', f'previd {previd} does not refer to a block')
+        parent_height, parent_utxo = state
+
+        txs = [self.object_db.get(txid) for txid in block['txids']]
+        height, utxo = execute_block(
+            block, parent, parent_height, parent_utxo, txs,
+            self.object_db.get, time.time(),
+        )
+        self.object_db.put_block(block, height, utxo)
+        await self._object_stored(oid, f'block (height {height})')
+
+    def _spawn(self, coro) -> None:
+        """Run a background task (tracked by the node if available)."""
+        if self.network is not None and hasattr(self.network, '_spawn'):
+            self.network._spawn(coro)
+        else:
+            asyncio.ensure_future(coro)
